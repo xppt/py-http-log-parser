@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "http-log-parser"
-version = "0.1.0"
+version = "0.1.1"
 description = "Cli tool to parse stream of http access events into json formatted events."
 authors = []
 

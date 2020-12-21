@@ -121,14 +121,8 @@ def nginx_parser(parse_query=True):
         if match is None:
             raise ValueError('Line is malformed')
 
-        def decode(bytes_val, decoder):
-            try:
-                return decoder(bytes_val)
-            except Exception:
-                raise
-
         values = (
-            decode(bytes_val, decoder)
+            decoder(bytes_val)
             for bytes_val, decoder in zip(match.groups(), _log_decoders)
         )
         ip, host, _user, ts, _method, url, _proto, status, size = values
@@ -136,17 +130,22 @@ def nginx_parser(parse_query=True):
         parsed_url = urllib.parse.urlparse(url)
 
         row = {
+            'status': status,
             'ip': ip,
-            'host': host,
             'ts': ts,
-            'path': url,
+            'path': parsed_url.path,
             'size': size,
         }
+
+        if host != '-':
+            row['host'] = host
 
         if parse_query:
             row['query'] = {
                 key: value for key, value in urllib.parse.parse_qsl(parsed_url.query)
             }
+        else:
+            row['query'] = parsed_url.query
 
         return row
 
