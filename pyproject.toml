@@ -3,6 +3,7 @@ name = "http-log-parser"
 version = "0.1.1"
 description = "Cli tool to parse stream of http access events into json formatted events."
 authors = []
+readme = "README.md"
 
 [tool.poetry.scripts]
 http-log-parser = "http_log_parser:main"
