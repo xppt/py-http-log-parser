@@ -1,6 +1,7 @@
 import datetime
 import re
 import urllib.parse
+from typing import NamedTuple, Dict, Any
 
 _unescape_pattern = re.compile(r'\\x([0-9a-z]{2})'.encode('ascii'), re.IGNORECASE)
 
@@ -12,28 +13,19 @@ def _nginx_unescape(value: bytes) -> bytes:
     return _unescape_pattern.sub(replace_char, value)
 
 
-_log_pattern = re.compile(
-    r'''^
-    ([\d.]+)[ ] # IP
-    (\S+)[ ] # dash (in combined) or hostname
-    (\S+)[ ] # user
-    \[([^\]]+)\][ ] # time
-    "
-        ([A-Z]+)[ ]  # method
-        ([^"\s]+)[ ] # url
-        ([^"])+      # proto
-    "[ ]
-    (\d+)[ ]    # status
-    (\d+)       # size
-    '''.encode('ascii'), re.VERBOSE)
-
-
-def _decode_ascii(value: bytes) -> str:
-    return _nginx_unescape(value).decode('ascii')
+def _decode_text(value: bytes) -> str:
+    return _nginx_unescape(value).decode('iso-8859-1')
 
 
 def _decode_host(value: bytes) -> str:
     return _nginx_unescape(value).decode('idna')
+
+
+def _decode_int(value: bytes) -> int:
+    try:
+        return int(value)
+    except ValueError:
+        raise LineParseError from None
 
 
 def _decode_noop(value):
@@ -70,23 +62,29 @@ def _decode_ts(value: bytes) -> int:
     if _last_decoded_ts_bytes == value:
         return _last_decoded_ts_result
 
-    sday, smon, syear, shour, smin, ssec, off_sign, off_hours, off_minutes \
-        = _nginx_time_pattern.fullmatch(value).groups()
+    match = _nginx_time_pattern.fullmatch(value)
+    if match is None:
+        raise LineParseError
 
-    local_ts = datetime.datetime(
-        year=int(syear),
-        month=_nginx_months.index(smon) + 1,
-        day=int(sday),
-        hour=int(shour),
-        minute=int(smin),
-        second=int(ssec),
-    )
+    sday, smon, syear, shour, smin, ssec, off_sign, off_hours, off_minutes = match.groups()
 
-    offset = datetime.timedelta(hours=int(off_hours), minutes=int(off_minutes))
-    if off_sign == '-':
-        offset = -offset
+    try:
+        local_ts = datetime.datetime(
+            year=int(syear),
+            month=_nginx_months.index(smon) + 1,
+            day=int(sday),
+            hour=int(shour),
+            minute=int(smin),
+            second=int(ssec),
+        )
 
-    result = _utc_dt_timestamp(local_ts - offset)
+        offset = datetime.timedelta(hours=int(off_hours), minutes=int(off_minutes))
+        if off_sign == '-':
+            offset = -offset
+
+        result = _utc_dt_timestamp(local_ts - offset)
+    except ValueError:
+        raise LineParseError from None
 
     _last_decoded_ts_bytes = value
     _last_decoded_ts_result = result
@@ -94,16 +92,36 @@ def _decode_ts(value: bytes) -> int:
     return result
 
 
+_log_pattern = re.compile(
+    r'''^
+    ([\d.]+)[ ] # ip
+    (\S+)[ ]    # dash (in combined) or hostname
+    (\S+)[ ]    # user
+    \[([^\]]+)\][ ] # time
+    "
+        ([A-Z]+)[ ]  # method
+        ([^"\s]+)[ ] # url
+        ([^"])+      # proto
+    "[ ]
+    (\d+)[ ]      # status
+    (\d+)[ ]      # size
+    "([^"]*)"[ ]  # referer
+    "([^"]*)"     # user_agent
+    '''.encode('ascii'), re.VERBOSE)
+
+
 _log_decoders = (
-    _decode_ascii,  # IP
-    _decode_host,   # hostname or dash
-    _decode_noop,   # user
-    _decode_ts,     # time
-    _decode_noop,   # method
-    _decode_ascii,  # url
-    _decode_noop,   # proto
-    int,            # status
-    int,            # size
+    _decode_text,  # IP
+    _decode_host,  # hostname or dash
+    _decode_noop,  # user
+    _decode_ts,    # time
+    _decode_text,  # method
+    _decode_text,  # url
+    _decode_noop,  # proto
+    _decode_int,   # status
+    _decode_int,   # size
+    _decode_text,  # referer
+    _decode_text,  # user_agent
 )
 
 
@@ -115,17 +133,27 @@ def _utc_dt_timestamp(dt: datetime.datetime) -> int:
     return int((dt - _UNIX_EPOCH).total_seconds())
 
 
-def nginx_parser(parse_query=True):
-    def parse_nginx_line(line: bytes):
+class LineParseError(Exception):
+    pass
+
+
+class NginxParser(NamedTuple):
+    parse_query: bool = True
+
+    def __call__(self, line: bytes) -> Dict[str, Any]:
+        """
+        :raises LineParseError
+        """
+
         match = _log_pattern.search(line)
         if match is None:
-            raise ValueError('Line is malformed')
+            raise LineParseError
 
         values = (
             decoder(bytes_val)
             for bytes_val, decoder in zip(match.groups(), _log_decoders)
         )
-        ip, host, _user, ts, _method, url, _proto, status, size = values
+        ip, host, _user, ts, method, url, _proto, status, size, referer, user_agent = values
 
         parsed_url = urllib.parse.urlparse(url)
 
@@ -133,14 +161,17 @@ def nginx_parser(parse_query=True):
             'status': status,
             'ip': ip,
             'ts': ts,
+            'method': method,
             'path': parsed_url.path,
             'size': size,
+            'referer': referer,
+            'user_agent': user_agent,
         }
 
         if host != '-':
             row['host'] = host
 
-        if parse_query:
+        if self.parse_query:
             row['query'] = {
                 key: value for key, value in urllib.parse.parse_qsl(parsed_url.query)
             }
@@ -148,5 +179,3 @@ def nginx_parser(parse_query=True):
             row['query'] = parsed_url.query
 
         return row
-
-    return parse_nginx_line
